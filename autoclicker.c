@@ -15,11 +15,15 @@
  *   -d <ms>        Hold duration per click in milliseconds (default: 10, <= interval)
  *   -c <count>     Stop after N clicks (default: 0 = infinite)
  *   -t <seconds>   Stop after T seconds (default: 0 = infinite)
+ *   -p <seconds>   Capture the cursor after a countdown and lock clicks there
+ *   -P <X,Y>       Lock clicks to the specified global-layout position
+ *   -g             Print the current cursor position and exit
  *   -h             Print this help
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
@@ -29,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -157,6 +162,123 @@ static int long_fits_time_t(long value) {
     time_t converted = (time_t)value;
 
     return (long)converted == value;
+}
+
+static void parse_position(const char *value, long *x, long *y) {
+    char *end = NULL;
+
+    errno = 0;
+    *x = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != ',')
+        die("Invalid position '%s' (expected X,Y)", value);
+
+    value = end + 1;
+    while (*value == ' ' || *value == '\t')
+        value++;
+
+    errno = 0;
+    *y = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0')
+        die("Invalid position '%s' (expected X,Y)", value);
+}
+
+/* Read Hyprland's global-layout coordinates from its command-line client. */
+static int get_cursor_position(long *x, long *y) {
+    char line[128];
+    FILE *pipe;
+    int status;
+    char *newline;
+    char *end = NULL;
+    char *y_text;
+
+    pipe = popen("hyprctl cursorpos", "r");
+    if (pipe == NULL) {
+        fprintf(stderr, "Cannot run hyprctl cursorpos: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (fgets(line, sizeof(line), pipe) == NULL) {
+        status = pclose(pipe);
+        if (running)
+            fprintf(stderr, "hyprctl cursorpos returned no position (status %d)\n", status);
+        return -1;
+    }
+
+    status = pclose(pipe);
+    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (running)
+            fprintf(stderr, "hyprctl cursorpos failed\n");
+        return -1;
+    }
+
+    newline = strchr(line, '\n');
+    if (newline != NULL)
+        *newline = '\0';
+
+    errno = 0;
+    *x = strtol(line, &end, 10);
+    if (errno != 0 || end == line || *end != ',') {
+        fprintf(stderr, "Unexpected hyprctl cursorpos output: '%s'\n", line);
+        return -1;
+    }
+
+    y_text = end + 1;
+    while (*y_text == ' ' || *y_text == '\t')
+        y_text++;
+    errno = 0;
+    *y = strtol(y_text, &end, 10);
+    if (errno != 0 || end == y_text || (*end != '\0' && *end != '\r')) {
+        fprintf(stderr, "Unexpected hyprctl cursorpos output: '%s'\n", line);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Hyprland accepts its cursorpos global-layout coordinates directly. */
+static int move_cursor_to(long x, long y) {
+    char x_text[32];
+    char y_text[32];
+    pid_t pid;
+    int status;
+
+    snprintf(x_text, sizeof(x_text), "%ld", x);
+    snprintf(y_text, sizeof(y_text), "%ld", y);
+
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork for hyprctl failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        execlp("hyprctl", "hyprctl", "--quiet", "dispatch", "movecursor",
+               x_text, y_text, (char *)NULL);
+        _exit(127);
+    }
+
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            if (!running) {
+                /* The child shares Ctrl-C, but also terminate it if needed. */
+                kill(pid, SIGTERM);
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+                    ;
+                return -1;
+            }
+            continue;
+        }
+        fprintf(stderr, "waitpid for hyprctl failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (running)
+            fprintf(stderr, "hyprctl could not move the cursor to %ld,%ld\n", x, y);
+        return -1;
+    }
+
+    return 0;
 }
 
 /* sleep for `ms` milliseconds unless a termination signal arrives */
@@ -309,7 +431,12 @@ static void usage(const char *prog, int status) {
         "  -d <ms>       Hold duration per click in ms     (default: 10, <= interval)\n"
         "  -c <count>    Stop after N clicks  (0 = infinite, default: 0)\n"
         "  -t <seconds>  Stop after T seconds (0 = infinite, default: 0)\n"
+        "  -p <seconds>  Capture cursor after a countdown, then lock target\n"
+        "  -P <X,Y>      Lock clicks to a global-layout position\n"
+        "  -g            Print current cursor position and exit\n"
         "  -h            Show this help\n\n"
+        "Fixed-position modes require hyprctl.\n"
+        "Press Ctrl-C at any time to cancel.\n\n"
         "Keyboard shortcut to stop: Ctrl-C\n\n"
         "Permissions:\n"
         "  Either run as root, or:\n"
@@ -328,20 +455,36 @@ int main(int argc, char *argv[]) {
     long hold_ms     = 10;
     long max_clicks  = 0;   /* 0 = unlimited */
     long max_secs    = 0;   /* 0 = unlimited */
+    long capture_secs = 0;
+    long target_x = 0;
+    long target_y = 0;
+    int fixed_position = 0;
+    int capture_requested = 0;
+    int show_cursor_position = 0;
     unsigned short btn = BTN_LEFT;
 
     struct sigaction sa = {0};
+    static const struct option long_options[] = {
+        {"capture", required_argument, NULL, 'p'},
+        {"position", required_argument, NULL, 'P'},
+        {"cursorpos", no_argument, NULL, 'g'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0},
+    };
     int opt;
 
     if (atexit(cleanup_uinput) != 0)
         die("atexit cleanup registration failed");
 
-    while ((opt = getopt(argc, argv, "i:b:d:c:t:h")) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:b:d:c:t:p:P:gh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i': interval_ms = parse_long(optarg, "interval"); break;
         case 'd': hold_ms     = parse_long(optarg, "hold duration"); break;
         case 'c': max_clicks  = parse_long(optarg, "click count"); break;
         case 't': max_secs    = parse_long(optarg, "duration"); break;
+        case 'p': capture_secs = parse_long(optarg, "capture countdown"); capture_requested = 1; break;
+        case 'P': parse_position(optarg, &target_x, &target_y); fixed_position = 1; break;
+        case 'g': show_cursor_position = 1; break;
         case 'b':
             if      (strcmp(optarg, "left")   == 0) btn = BTN_LEFT;
             else if (strcmp(optarg, "right")  == 0) btn = BTN_RIGHT;
@@ -363,6 +506,8 @@ int main(int argc, char *argv[]) {
     if (hold_ms > interval_ms) die("Hold duration must be <= interval");
     if (max_clicks < 0)   die("Click count must be >= 0");
     if (max_secs < 0)     die("Duration must be >= 0 seconds");
+    if (capture_requested && capture_secs <= 0)
+        die("Capture countdown must be > 0 seconds");
     if (!long_fits_time_t(max_secs)) die("Duration is too large");
 
     /* install signal handlers */
@@ -371,6 +516,34 @@ int main(int argc, char *argv[]) {
         die_errno("sigemptyset failed", errno);
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0)
         die_errno("sigaction failed", errno);
+
+    if (show_cursor_position) {
+        if (get_cursor_position(&target_x, &target_y) < 0)
+            return EXIT_FAILURE;
+        printf("%ld,%ld\n", target_x, target_y);
+        return EXIT_SUCCESS;
+    }
+
+    if (capture_requested) {
+        if (fixed_position)
+            die("Use either --capture or --position, not both");
+
+        fprintf(stderr, "Move the pointer to the target. Capturing in");
+        for (long seconds = capture_secs; running && seconds > 0; seconds--) {
+            fprintf(stderr, " %ld", seconds);
+            fflush(stderr);
+            sleep_ms(1000);
+        }
+        fputc('\n', stderr);
+
+        if (!running)
+            return EXIT_SUCCESS;
+        if (get_cursor_position(&target_x, &target_y) < 0)
+            return EXIT_FAILURE;
+
+        fixed_position = 1;
+        fprintf(stderr, "Captured position: %ld,%ld\n", target_x, target_y);
+    }
 
     setup_uinput();
 
@@ -394,10 +567,12 @@ int main(int argc, char *argv[]) {
         "  button   : %s\n"
         "  interval : %ld ms\n"
         "  hold     : %ld ms\n"
+        "  position : %s\n"
         "  limit    : %s\n"
         "  duration : %s\n"
         "Press Ctrl-C to stop.\n\n",
         btn_name, interval_ms, hold_ms,
+        fixed_position ? "fixed" : "current cursor",
         click_limit,
         duration_limit);
 
@@ -408,6 +583,11 @@ int main(int argc, char *argv[]) {
         /* time limit */
         if (max_secs > 0 && elapsed_at_least(&start, max_secs)) break;
 
+        if (fixed_position && move_cursor_to(target_x, target_y) < 0) {
+            if (!running)
+                break;
+            die("Cannot move cursor; ensure this runs in your Hyprland session");
+        }
         click(uinput_fd, btn, hold_ms);
         if (count == LONG_MAX)
             die("Click counter overflow");
